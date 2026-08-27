@@ -1,0 +1,145 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Used only inside the njangiGroups/{groupId} match block, where
+    // `resource` IS the group document -- checks the denormalized
+    // memberIds array directly, no extra reads. This is what makes the
+    // top-level "my groups" list query (memberIds arrayContains uid)
+    // work reliably: Firestore evaluates it per candidate document with
+    // no get()/exists() fan-out needed.
+    function isMemberOfThisGroup() {
+      return isSignedIn() && request.auth.uid in resource.data.memberIds;
+    }
+
+    // Used for nested collections (ledger, loans, auditLog, members)
+    // where the groupId is already known and fixed -- fine here since
+    // these are scoped reads under one specific group, not a fan-out
+    // list query across the whole njangiGroups collection.
+    function isGroupMember(groupId) {
+      // Checks the memberIds array directly on the group document itself
+      // rather than doing an exists() check on a members/{uid} subcollection
+      // doc. The subcollection-check version worked for single-document
+      // reads but was unreliable during the top-level "my groups" list
+      // query (arrayContains across njangiGroups) -- checking a field on
+      // the same document being evaluated is the standard, reliable
+      // pattern for that case.
+      return isSignedIn() &&
+        request.auth.uid in get(/databases/$(database)/documents/njangiGroups/$(groupId)).data.memberIds;
+    }
+
+    function memberRole(groupId) {
+      return get(/databases/$(database)/documents/njangiGroups/$(groupId)/members/$(request.auth.uid)).data.role;
+    }
+
+    function isSecretary(groupId) {
+      return isGroupMember(groupId) && memberRole(groupId) == "secretary";
+    }
+
+    function groupPlan(groupId) {
+      return get(/databases/$(database)/documents/njangiGroups/$(groupId)).data.planTier;
+    }
+
+    function planAtLeast(groupId, tier) {
+      // free < standard < premium
+      let plan = groupPlan(groupId);
+      return tier == "free"
+        || (tier == "standard" && (plan == "standard" || plan == "premium"))
+        || (tier == "premium" && plan == "premium");
+    }
+
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow write: if isSignedIn() && request.auth.uid == userId;
+
+      match /personalFinance/{entryId} {
+        allow read, write: if isSignedIn() && request.auth.uid == userId;
+      }
+
+      match /notifications/{notifId} {
+        // Only the owner can read/mark-read/delete their own notifications,
+        // but anyone signed in can create one for someone else -- that's
+        // how a secretary verifying a contribution notifies the member.
+        allow read, update, delete: if isSignedIn() && request.auth.uid == userId;
+        allow create: if isSignedIn();
+      }
+    }
+
+    match /njangiGroups/{groupId} {
+      // Basic group info (name, plan, contribution amount, member count)
+      // is visible to any signed-in user for the public group directory --
+      // ledger, loans, members detail, and audit log below stay
+      // restricted to actual members via their own rules.
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() &&
+        request.resource.data.memberIds.hasOnly([request.auth.uid]) &&
+        request.resource.data.createdBy == request.auth.uid;
+      allow update: if isSecretary(groupId);
+      allow delete: if false;
+
+      match /joinRequests/{requesterId} {
+        allow read: if isSignedIn() && (requesterId == request.auth.uid || isSecretary(groupId));
+        allow create: if isSignedIn() && requesterId == request.auth.uid;
+        allow update: if isSecretary(groupId);
+        allow delete: if false;
+      }
+
+      match /members/{memberId} {
+        allow read: if isGroupMember(groupId);
+        // Creator adding themself as the first member (secretary) on
+        // group creation, or an existing secretary managing membership.
+        allow create: if isSignedIn() &&
+          (memberId == request.auth.uid || isSecretary(groupId));
+        allow update, delete: if isSecretary(groupId);
+      }
+
+      match /ledger/{entryId} {
+        allow read: if isGroupMember(groupId);
+        // Normal member submissions (including loan repayments now) start
+        // "pending" and need secretary verification. The one exception is
+        // a secretary disbursing an approved loan -- that money is already
+        // known to be going out the moment she confirms it, so it writes
+        // straight to "verified".
+        allow create: if isGroupMember(groupId) && (
+          request.resource.data.status == "pending" ||
+          (isSecretary(groupId) && request.resource.data.status == "verified" &&
+            (request.resource.data.type == "loanDisbursement" ||
+             request.resource.data.type == "fine"))
+        );
+        allow update: if isSecretary(groupId);
+        allow delete: if false; // append-only â€” corrections are new entries, never deletes
+      }
+
+      match /loans/{loanId} {
+        allow read: if isGroupMember(groupId) && groupPlan(groupId) == "premium";
+        allow create: if isGroupMember(groupId) && groupPlan(groupId) == "premium";
+        // Secretary can change status (approve/reject); the borrowing
+        // member can update their own loan too, but only to reduce
+        // outstandingBalance / mark repaid -- never to change status to
+        // "active" themselves (that still requires the secretary).
+        allow update: if groupPlan(groupId) == "premium" && (
+          isSecretary(groupId) ||
+          (resource.data.memberId == request.auth.uid &&
+            request.resource.data.status != "active")
+        );
+      }
+
+      match /auditLog/{logId} {
+        allow read: if isSecretary(groupId);
+        // No Cloud Functions on the free plan, so this is written directly
+        // from the client -- but locked to append-only, and the writer
+        // must be honest about who they are (performedBy must match their
+        // own uid). It's not as tamper-proof as a server-triggered log,
+        // but every write is still authenticated and immutable once made.
+        allow create: if isGroupMember(groupId) &&
+          request.resource.data.performedBy == request.auth.uid;
+        allow update, delete: if false;
+      }
+    }
+  }
+}

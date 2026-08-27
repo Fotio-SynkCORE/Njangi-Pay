@@ -1,0 +1,29 @@
+{
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "njangi-pay",
+          "appId": "1:19802712993:android:695be487aea58dcdb7b9e0",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "njangi-pay",
+          "configurations": {
+            "android": "1:19802712993:android:695be487aea58dcdb7b9e0",
+            "ios": "1:19802712993:ios:778c808ccc5d1d22b7b9e0",
+            "macos": "1:19802712993:ios:778c808ccc5d1d22b7b9e0",
+            "web": "1:19802712993:web:6a1b0d08fbe0b785b7b9e0",
+            "windows": "1:19802712993:web:2876601667ee192db7b9e0"
+          }
+        }
+      }
+    }
+  }
+}
